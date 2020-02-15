@@ -1,147 +1,171 @@
 extern crate clap;
-use clap::App;
-use std::io::{BufReader, Read, Write};
+use std::io::{BufReader, Write};
 use std::fs::File;
+mod reader;
 
 fn main() -> Result<(), std::io::Error> {
-    let args = App::new("xxc - print colorful hex")
+    let args = clap::App::new("mpegts_color - colorizes hex output with mpegts rules")
         .version("0.0.1")
         .author("Milan Markovic <zivotinja@gmail.com>")
-        .about("hex print with colors")
-        .args_from_usage(
-            "-c, --color=[FILE] 'sets custom coloring scheme'
-            -a, --auto         'color hex by context'
-            <INPUT>             'input file'")
+        .args_from_usage("<INPUT>  'input file'
+                          <COLOR>  'color file'")
         .get_matches();
 
     let f = File::open(args.value_of("INPUT").unwrap())?;
     let mut reader = BufReader::new(f);
+    let clr = File::open(args.value_of("COLOR").unwrap())?;
+    let mut color_reader = BufReader::new(clr);
 
-    let res = if let Some(clr) = args.value_of("color") {
-        let f = File::open(clr)?;
-        let mut color_reader = BufReader::new(f);
-        print(&mut reader, &mut color_reader) 
-    } else if args.is_present("auto") {
-        print_auto(&mut reader)
-    } else {
-        print(&mut reader, &mut ConstReader{ value: 15 })
-    };
-
-    match res {
+    match print(&mut reader, &mut color_reader) {
         Err(ref e) if e.kind() == std::io::ErrorKind::BrokenPipe => Ok(()),
-        _ => res,
+        other => other,
     }
 }
 
-struct ConstReader {
-    value: u8
-}
+fn print<R: std::io::Read>(reader: &mut R, color_reader: &mut R) -> Result<(), std::io::Error> {
+    use reader::read_fill;
+    let mut buf = [0u8; 16];
+    let mut clr = [0u8; 16];
+    let mut offset = 0usize;
+    let mut last_color = 0u8;
 
-impl Read for ConstReader {
-    fn read(&mut self, buf: &mut [u8]) -> Result<usize, std::io::Error> {
-       for b in buf.iter_mut() {
-           *b = self.value;
-       }
-
-       Ok(buf.len())
-    }
-}
-
-fn color_auto(buf: &[u8; 16]) -> [u8; 16] {
-    let mut res = [15u8; 16];
-
-    for (b, clr) in buf.iter().zip(res.iter_mut()) {
-        if b.is_ascii() {
-            if b.is_ascii_control() {
-                *clr = 51;
-            } else if b.is_ascii_digit() {
-                *clr = 50; 
-            } else {
-                *clr = 97;
+    loop {
+        match (read_fill(reader, &mut buf)?, read_fill(color_reader, &mut clr)?)
+        {
+            (0, _) => return Ok(()), // EOF
+            (16, 16) => {
+                print_line(offset, &buf[..], &clr[..])?;
+                offset += 16;
+                last_color = clr[15]; 
+            },
+            (len1, len2) => {
+                if len1 > len2 {
+                    for c in clr[len2..len1].iter_mut() {
+                        *c = last_color;
+                    }
+                }
+                
+                print_line(offset, &buf[..len1], &clr[..len1])?;
+                return Ok(())
             }
+        }
+    };
+}
+
+fn print_line(offset: usize, buf: &[u8], clr: &[u8]) -> Result<(), std::io::Error> {
+    let stdout = std::io::stdout();
+    let mut handle = stdout.lock();
+    let column_width = 2;
+
+    handle.write_all(&offset_to_hex(offset))?;
+    handle.write_all(b": ")?;
+    let mut last_color = 0;
+
+    for (idx, (b, c)) in buf.iter().zip(clr.iter()).enumerate() {
+        if *c != last_color {
+            last_color = *c;
+            write_color(&mut handle, last_color)?;
+        }
+
+        handle.write_all(byte_to_hex2(*b).as_bytes())?;
+
+        if idx % column_width == column_width - 1 {
+            handle.write_all(b" ")?;
+        }
+    }
+    
+    // handling empty space
+    for i in buf.len()..16 {
+        handle.write_all(b"  ")?;
+
+        if i % column_width == column_width - 1 {
+            handle.write_all(b" ")?;
+        }
+    }
+
+    // Text representation
+    handle.write(b" ")?;
+
+    for (b, c) in buf.iter().zip(clr.iter()) {
+        if *c != last_color {
+            last_color = *c;
+            write_color(&mut handle, last_color)?;
+        }
+
+        if b.is_ascii() && b.is_ascii_alphanumeric() {
+            let chr = [*b];
+            handle.write(&chr)?;
         } else {
-            *clr = 15;
+            handle.write(b".")?;
+        }
+    }
+
+    handle.write_all("\x1b[0m\n".as_bytes())?;
+
+    Ok(())
+}
+
+fn write_color<W: Write>(handle: &mut W, color: u8) -> Result<(), std::io::Error> {
+    handle.write_all(b"\x1b[38;5;")?;
+    handle.write_all(byte_to_dec(color).as_bytes())?;
+    handle.write_all(b"m")?;
+    Ok(())
+}
+
+fn offset_to_hex(offset: usize) -> [u8; 16] {
+    let mut res = [0u8; 16];
+    
+    for i in 0..4 {
+        let shift = (3-i)*8;
+        if let [u, l] = byte_to_hex2(((offset & (0xFF << shift)) >> shift) as u8).as_bytes() {
+            res[2*i] = *u;
+            res[2*i+1] = *l;
         }
     }
 
     res
 }
 
-fn print_auto(reader: &mut dyn Read) -> Result<(), std::io::Error> {
-    let mut buf = [0u8; 16];
-    let mut offset = 0u64;
+fn byte_to_hex2(b: u8) -> &'static str {
+    const MAP: [&str; 256] = [
+        "00", "01", "02", "03", "04", "05", "06", "07", "08", "09", "0a", "0b", "0c", "0d", "0e", "0f",
+        "10", "11", "12", "13", "14", "15", "16", "17", "18", "19", "1a", "1b", "1c", "1d", "1e", "1f",
+        "20", "21", "22", "23", "24", "25", "26", "27", "28", "29", "2a", "2b", "2c", "2d", "2e", "2f",
+        "30", "31", "32", "33", "34", "35", "36", "37", "38", "39", "3a", "3b", "3c", "3d", "3e", "3f", 
+        "40", "41", "42", "43", "44", "45", "46", "47", "48", "49", "4a", "4b", "4c", "4d", "4e", "4f", 
+        "50", "51", "52", "53", "54", "55", "56", "57", "58", "59", "5a", "5b", "5c", "5d", "5e", "5f", 
+        "60", "61", "62", "63", "64", "65", "66", "67", "68", "69", "6a", "6b", "6c", "6d", "6e", "6f", 
+        "70", "71", "72", "73", "74", "75", "76", "77", "78", "79", "7a", "7b", "7c", "7d", "7e", "7f", 
+        "80", "81", "82", "83", "84", "85", "86", "87", "88", "89", "8a", "8b", "8c", "8d", "8e", "8f", 
+        "90", "91", "92", "93", "94", "95", "96", "97", "98", "99", "9a", "9b", "9c", "9d", "9e", "9f", 
+        "a0", "a1", "a2", "a3", "a4", "a5", "a6", "a7", "a8", "a9", "aa", "ab", "ac", "ad", "ae", "af", 
+        "b0", "b1", "b2", "b3", "b4", "b5", "b6", "b7", "b8", "b9", "ba", "bb", "bc", "bd", "be", "bf", 
+        "c0", "c1", "c2", "c3", "c4", "c5", "c6", "c7", "c8", "c9", "ca", "cb", "cc", "cd", "ce", "cf", 
+        "d0", "d1", "d2", "d3", "d4", "d5", "d6", "d7", "d8", "d9", "da", "db", "dc", "dd", "de", "df", 
+        "e0", "e1", "e2", "e3", "e4", "e5", "e6", "e7", "e8", "e9", "ea", "eb", "ec", "ed", "ee", "ef", 
+        "f0", "f1", "f2", "f3", "f4", "f5", "f6", "f7", "f8", "f9", "fa", "fb", "fc", "fd", "fe", "ff"];
 
-    loop {
-        match reader.read(&mut buf)?
-        {
-            0 => return Ok(()), // EOF
-            16 => {
-                print_line(offset, &buf[..], &color_auto(&buf))?;
-                offset += 16;
-            },
-            len => print_line(offset, &buf[..len], &color_auto(&buf))?,
-        }
-    };
+    MAP[b as usize]
 }
 
+fn byte_to_dec(b: u8) -> &'static str {
+    const MAP: [&str; 256] = [
+        "0",    "1",   "2",   "3",   "4",   "5",   "6",   "7",   "8",   "9",   "10",  "11",  "12",  "13",  "14",  "15", 
+        "16",  "17",   "18",  "19",  "20",  "21",  "22",  "23",  "24",  "25",  "26",  "27",  "28",  "29",  "30",  "31", 
+        "32",  "33",   "34",  "35",  "36",  "37",  "38",  "39",  "40",  "41",  "42",  "43",  "44",  "45",  "46",  "47", 
+        "48",  "49",   "50",  "51",  "52",  "53",  "54",  "55",  "56",  "57",  "58",  "59",  "60",  "61",  "62",  "63", 
+        "64",  "65",   "66",  "67",  "68",  "69",  "70",  "71",  "72",  "73",  "74",  "75",  "76",  "77",  "78",  "79", 
+        "80",  "81",   "82",  "83",  "84",  "85",  "86",  "87",  "88",  "89",  "90",  "91",  "92",  "93",  "94",  "95", 
+        "96",  "97",   "98",  "99", "100", "101", "102", "103", "104", "105", "106", "107", "108", "109", "110", "111", 
+        "112", "113", "114", "115", "116", "117", "118", "119", "120", "121", "122", "123", "124", "125", "126", "127", 
+        "128", "129", "130", "131", "132", "133", "134", "135", "136", "137", "138", "139", "140", "141", "142", "143", 
+        "144", "145", "146", "147", "148", "149", "150", "151", "152", "153", "154", "155", "156", "157", "158", "159", 
+        "160", "161", "162", "163", "164", "165", "166", "167", "168", "169", "170", "171", "172", "173", "174", "175", 
+        "176", "177", "178", "179", "180", "181", "182", "183", "184", "185", "186", "187", "188", "189", "190", "191", 
+        "192", "193", "194", "195", "196", "197", "198", "199", "200", "201", "202", "203", "204", "205", "206", "207", 
+        "208", "209", "210", "211", "212", "213", "214", "215", "216", "217", "218", "219", "220", "221", "222", "223", 
+        "224", "225", "226", "227", "228", "229", "230", "231", "232", "233", "234", "235", "236", "237", "238", "239", 
+        "240", "241", "242", "243", "244", "245", "246", "247", "248", "249", "250", "251", "252", "253", "254", "255"];
 
-fn print(reader: &mut dyn Read, color_reader: &mut dyn Read) -> Result<(), std::io::Error> {
-    let mut buf = [0u8; 16];
-    let mut clr = [0u8; 16];
-    let mut offset = 0u64;
-
-    loop {
-        match (reader.read(&mut buf)?, color_reader.read(&mut clr)?)
-        {
-            (0, _) => return Ok(()), // EOF
-            (16, 16) => {
-                print_line(offset, &buf[..], &clr[..])?;
-                offset += 16;
-            },
-            (len1, len2) if len1 <= len2 => print_line(offset, &buf[..len1], &clr[..len1])?,
-            (_, _) => return Err(std::io::Error::new(std::io::ErrorKind::Other, "mismatch in color and input size")),
-        }
-    };
-}
-
-
-fn print_line(offset: u64, buf: &[u8], clr: &[u8]) -> Result<(), std::io::Error> {
-    use colorful::{Color, Colorful};
-    use std::str;
-
-    let stdout = std::io::stdout();
-    let mut handle = stdout.lock();
-    handle.write_fmt(format_args!("{:08x}: ", offset))?;
-    let mut last_color = Color::White;
-    for (idx, (b, c)) in buf.iter().zip(clr.iter()).enumerate() {
-        last_color = get_color(*c);
-        handle.write_fmt(format_args!("{}", format!("{:02x}", b).color(last_color)))?;
-        if idx % 2 == 1 {
-            handle.write_fmt(format_args!("{}", " ".color(last_color)))?;
-        }
-    }
-    for i in buf.len()..16 {
-        handle.write_fmt(format_args!("{}", "  ".color(last_color)))?;
-
-        if i % 2 == 1 {
-            handle.write_fmt(format_args!("{}", " ".color(last_color)))?;
-        }
-    }
-    handle.write_fmt(format_args!("{}", "  ".color(last_color)))?;
-    for (b, c) in buf.iter().zip(clr.iter()) {
-        last_color = get_color(*c);
-        if b.is_ascii() && !b.is_ascii_control() { 
-            let chr = [*b];
-            handle.write_fmt(format_args!("{}", unsafe { str::from_utf8_unchecked(&chr[..]) }.color(last_color)))?;
-        } else {
-            handle.write_fmt(format_args!("{}", ".".color(last_color)))?;
-        }
-    }
-    handle.write_all(b"\n")?;
-    Ok(())
-}
-
-fn get_color(c: u8) -> colorful::Color {
-    use colorful::Color;
-    *Color::iterator().nth(c as usize).unwrap()
+    MAP[b as usize]
 }

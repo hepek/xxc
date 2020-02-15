@@ -8,4 +8,18 @@ edition = "2018"
 
 [dependencies]
 clap = "*"
-colorful = "*"
+
+[[bin]]
+name = "xxc"
+path = "src/main.rs"
+
+[[bin]]
+name = "colors_auto"
+path = "src/auto.rs"
+
+
+[[bin]]
+name = "colors_mpegts"
+path = "src/mpegts.rs"
+
+[profile.release]
